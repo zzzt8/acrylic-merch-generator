@@ -1,6 +1,6 @@
 import React, { useEffect, useRef, useState } from 'react';
 import * as fabric from 'fabric';
-import { Upload, RefreshCw, Layers, Wand2, X, Download, RotateCcw, RotateCw, FlipHorizontal, FlipVertical, Check, Shield, Undo2, Trash2 } from 'lucide-react';
+import { Upload, RefreshCw, Layers, Wand2, X, Download, RotateCcw, RotateCw, FlipHorizontal, FlipVertical, Check, Shield, Undo2, Trash2, Settings } from 'lucide-react';
 
 export default function App() {
   const canvasRef = useRef<HTMLCanvasElement>(null);
@@ -87,11 +87,11 @@ export default function App() {
       if (!obj) return;
       obj.set({
         borderColor: '#0066FF',
-        borderScaleFactor: 10,
-        cornerColor: '#0066FF',
-        cornerStrokeColor: '#0066FF',
-        cornerSize: 30,
-        transparentCorners: false,
+        borderScaleFactor: 3,
+        borderColor: '#FF6A00',
+        cornerColor: '#FF6A00',
+        cornerStrokeColor: '#FFFFFF',
+        cornerSize: 16,
         cornerStyle: 'circle',
         padding: 10,
       });
@@ -461,52 +461,237 @@ export default function App() {
     saveCanvasState(fabricCanvas);
   };
 
+  // 轮询定时器 Ref
+  const pollingIntervalRef = useRef<NodeJS.Timeout | null>(null);
+
+  // 清理轮询定时器
+  const clearPolling = () => {
+    if (pollingIntervalRef.current) {
+      clearInterval(pollingIntervalRef.current);
+      pollingIntervalRef.current = null;
+    }
+  };
+
+  // 组件卸载时清理定时器
+  useEffect(() => {
+    return () => {
+      clearPolling();
+    };
+  }, []);
+
+  // 图片压缩函数 - 保持 2100x2100，仅压缩质量
+  const compressImage = (dataUrl: string, maxSize: number = 2100, quality: number = 0.9): Promise<string> => {
+    return new Promise((resolve, reject) => {
+      const img = new Image();
+      img.onload = () => {
+        let { width, height } = img;
+
+        // 限制最大尺寸（保持 2100x2100）
+        if (width > maxSize || height > maxSize) {
+          if (width > height) {
+            height = Math.round((height / width) * maxSize);
+            width = maxSize;
+          } else {
+            width = Math.round((width / height) * maxSize);
+            height = maxSize;
+          }
+        }
+
+        const canvas = document.createElement('canvas');
+        canvas.width = width;
+        canvas.height = height;
+        const ctx = canvas.getContext('2d');
+        if (!ctx) {
+          reject(new Error('Failed to get canvas context'));
+          return;
+        }
+
+        // 使用平滑绘制
+        ctx.imageSmoothingEnabled = true;
+        ctx.imageSmoothingQuality = 'high';
+        ctx.drawImage(img, 0, 0, width, height);
+
+        // 递归尝试不同质量直到文件小于 500KB
+        const tryCompress = (q: number): void => {
+          canvas.toBlob((blob) => {
+            if (blob) {
+              if (blob.size > 500 * 1024 && q > 0.3) {
+                // 如果还是太大，降低质量重试
+                tryCompress(q - 0.1);
+              } else {
+                resolve(canvas.toDataURL('image/jpeg', q));
+              }
+            } else {
+              resolve(canvas.toDataURL('image/jpeg', 0.9));
+            }
+          }, 'image/jpeg', q);
+        };
+
+        tryCompress(quality);
+      };
+      img.onerror = () => reject(new Error('Failed to load image'));
+      img.src = dataUrl;
+    });
+  };
+
+  // 将 DataURL 转换为 Blob
+  const dataURLtoBlob = (dataUrl: string): Promise<Blob> => {
+    return new Promise((resolve, reject) => {
+      const img = new Image();
+      img.onload = () => {
+        const canvas = document.createElement('canvas');
+        canvas.width = img.width;
+        canvas.height = img.height;
+        const ctx = canvas.getContext('2d');
+        if (!ctx) {
+          reject(new Error('Failed to get canvas context'));
+          return;
+        }
+        ctx.drawImage(img, 0, 0);
+        canvas.toBlob((blob) => {
+          if (blob) {
+            resolve(blob);
+          } else {
+            reject(new Error('Failed to convert to blob'));
+          }
+        }, 'image/jpeg', 0.9);
+      };
+      img.onerror = () => reject(new Error('Failed to load image'));
+      img.src = dataUrl;
+    });
+  };
+
+  // 发送 POST 请求到 n8n
+  const sendToWebhook = async (lineartDataUrl: string, maskDataUrl: string): Promise<string> => {
+    // 压缩图片
+    setLoadingStep('压缩图片中...');
+    const [compressedLineart, compressedMask] = await Promise.all([
+      compressImage(lineartDataUrl),
+      compressImage(maskDataUrl)
+    ]);
+
+    // 转换为 Blob
+    const [lineartBlob, maskBlob] = await Promise.all([
+      dataURLtoBlob(compressedLineart),
+      dataURLtoBlob(compressedMask)
+    ]);
+
+    // 创建 FormData
+    const formData = new FormData();
+    formData.append('lineart', lineartBlob, 'lineart.jpg');
+    formData.append('mask', maskBlob, 'mask.jpg');
+
+    // 发送请求
+    const response = await fetch('https://n8n.prismlab.top/webhook/apple-generate', {
+      method: 'POST',
+      body: formData,
+    });
+
+    if (!response.ok) {
+      throw new Error(`HTTP error! status: ${response.status}`);
+    }
+
+    const data = await response.json();
+
+    // 兼容性提取：n8n 返回的是数组格式
+    const promptId = Array.isArray(data) ? data[0].prompt_id : data.prompt_id;
+
+    if (!promptId) {
+      throw new Error('未获取到有效的 prompt_id，请检查后端返回数据');
+    }
+
+    return promptId;
+  };
+
+  // 轮询查件
+  const pollForResult = (promptId: string): Promise<{ preview_url: string; prod_url: string }> => {
+    return new Promise((resolve, reject) => {
+      setLoadingStep('云端显卡渲染中...');
+
+      // 立即执行一次查询
+      const check = async () => {
+        try {
+          const response = await fetch(`https://n8n.prismlab.top/webhook/check-image?prompt_id=${promptId}`);
+          if (!response.ok) {
+            throw new Error(`HTTP error! status: ${response.status}`);
+          }
+
+          const data = await response.json();
+
+          if (data.status === 'done') {
+            clearPolling();
+            console.log('渲染完成!', data);
+            resolve({
+              preview_url: data.preview_url,
+              prod_url: data.prod_url
+            });
+          } else if (data.status === 'failed') {
+            clearPolling();
+            reject(new Error('渲染失败'));
+          } else {
+            // 继续轮询
+            setLoadingStep(`云端显卡渲染中... (${data.progress || '处理中'})`);
+          }
+        } catch (error) {
+          clearPolling();
+          reject(error);
+        }
+      };
+
+      // 启动定时器，每3秒查询一次
+      pollingIntervalRef.current = setInterval(check, 3000);
+      check(); // 立即执行第一次
+    });
+  };
+
   const generateImages = async () => {
     if (!fabricCanvas) return;
+
+    // 清理之前的轮询
+    clearPolling();
     
     setIsGenerating(true);
     setLoadingStep('正在读取线稿坐标...');
+    setResultImages(null);
 
     try {
-      // Create an in-memory Export Canvas
+      // 创建导出画布
       const exportCanvas = new fabric.Canvas(null, {
         width: CANVAS_SIZE,
         height: CANVAS_SIZE,
         preserveObjectStacking: true,
       });
 
-      // Clone the lineart objects to the export canvas
+      // 克隆线稿对象
       const lineartObjects = fabricCanvas.getObjects().filter(obj => (obj as any).id === 'lineart-layer');
-      
+
       for (const obj of lineartObjects) {
         const clonedObj = await obj.clone();
         exportCanvas.add(clonedObj);
       }
 
-      // 1. Prepare for 4.png (Synthesized Lineart)
+      // 1. 导出白底线稿 (lineart)
       exportCanvas.set('backgroundColor', '#FFFFFF');
       exportCanvas.renderAll();
-      
-      // Export 4.png
-      const img4DataUrl = exportCanvas.toDataURL({
+
+      const lineartDataUrl = exportCanvas.toDataURL({
         format: 'png',
         multiplier: 1,
         quality: 1
       });
 
       setLoadingStep('AI 引擎切割中...');
-      await new Promise(resolve => setTimeout(resolve, 800)); // Simulate processing
+      await new Promise(resolve => setTimeout(resolve, 500));
 
-      // 2. Prepare for 5.png (Character Mask)
+      // 2. 导出黑底白遮罩 (mask)
       exportCanvas.set('backgroundColor', '#000000');
-      
-      // Apply ColorMatrix to make lineart pure white
+
       const filter = new fabric.filters.ColorMatrix({
         matrix: [
-          0, 0, 0, 0, 255, // R
-          0, 0, 0, 0, 255, // G
-          0, 0, 0, 0, 255, // B
-          0, 0, 0, 1, 0    // A
+          0, 0, 0, 0, 255,
+          0, 0, 0, 0, 255,
+          0, 0, 0, 0, 255,
+          0, 0, 0, 1, 0
         ]
       });
 
@@ -517,52 +702,73 @@ export default function App() {
           obj.applyFilters();
         }
       }
-      
+
       exportCanvas.renderAll();
-      
-      // Export 5.png
-      const img5DataUrl = exportCanvas.toDataURL({
+
+      const maskDataUrl = exportCanvas.toDataURL({
         format: 'png',
         multiplier: 1,
         quality: 1
       });
 
-      setLoadingStep('正在渲染高光质感...');
-      await new Promise(resolve => setTimeout(resolve, 1500)); // Simulate API call
-
-      // Dispose the in-memory canvas
+      // 清理导出画布
       exportCanvas.dispose();
 
-      // Save to history
+      // 保存到历史记录
       setHistory(prev => [{
         id: Date.now().toString(),
-        line: img4DataUrl,
-        mask: img5DataUrl,
+        line: lineartDataUrl,
+        mask: maskDataUrl,
         timestamp: Date.now()
       }, ...prev]);
 
-      // Mock result
+      // 步骤2: 发单拿号
+      setLoadingStep('排队中...');
+      const promptId = await sendToWebhook(lineartDataUrl, maskDataUrl);
+
+      // 步骤3 & 4: 轮询查件 & 处理结果
+      const result = await pollForResult(promptId);
+
+      // 展示结果
       setResultImages({
-        effect: 'https://picsum.photos/seed/acrylic-effect/800/800',
-        production: 'https://picsum.photos/seed/acrylic-prod/800/800'
+        effect: result.preview_url,
+        production: result.prod_url
       });
 
     } catch (error) {
-      console.error('Generation failed:', error);
+      console.error('生成失败:', error);
       alert('生成失败，请重试');
     } finally {
+      clearPolling();
       setIsGenerating(false);
+    }
+  };
+
+  // 下载图片函数（跨域兼容）
+  const downloadImage = async (url: string, filename: string) => {
+    try {
+      const response = await fetch(url);
+      const blob = await response.blob();
+      const blobUrl = window.URL.createObjectURL(blob);
+      const link = document.createElement('a');
+      link.href = blobUrl;
+      link.download = filename;
+      document.body.appendChild(link);
+      link.click();
+      document.body.removeChild(link);
+      window.URL.revokeObjectURL(blobUrl);
+    } catch (error) {
+      console.error('下载失败:', error);
+      // 降级方案：直接打开链接
+      window.open(url, '_blank');
     }
   };
 
   return (
     <div 
-      className="min-h-screen bg-black text-white relative overflow-hidden font-sans"
+      className="min-h-screen text-gray-800 relative overflow-hidden font-sans"
       style={{
-        backgroundImage: 'url(/background.jpg)',
-        backgroundSize: 'cover',
-        backgroundPosition: 'center',
-        backgroundRepeat: 'no-repeat'
+        background: 'linear-gradient(135deg, #fdfbfb 0%, #ebedee 100%)',
       }}
       onDragEnter={handleDragEnter}
       onDragOver={handleDragOver}
@@ -571,9 +777,9 @@ export default function App() {
     >
       {/* Drag Overlay */}
       {isDragging && (
-        <div className="absolute inset-0 z-[100] bg-accent-orange/10 backdrop-blur-sm border-4 border-dashed border-accent-orange flex items-center justify-center">
-          <div className="text-2xl font-bold text-white tracking-wider flex items-center gap-4 bg-black/80 px-8 py-4 rounded-2xl border border-white/10">
-            <Upload className="w-8 h-8 animate-bounce text-accent-orange" />
+        <div className="absolute inset-0 z-[100] bg-gray-500/10 backdrop-blur-sm border-4 border-dashed border-gray-400 flex items-center justify-center">
+          <div className="text-2xl font-bold text-gray-700 tracking-wider flex items-center gap-4 bg-white/90 backdrop-blur-xl px-8 py-4 rounded-2xl border border-gray-200 shadow-xl">
+            <Upload className="w-8 h-8 animate-bounce text-gray-600" />
             松开鼠标，将图片添加到画布
           </div>
         </div>
@@ -581,133 +787,136 @@ export default function App() {
 
       {/* Background decoration - subtle glow */}
       <div className="absolute inset-0 pointer-events-none">
-        <div className="absolute top-1/4 left-1/4 w-96 h-96 bg-accent-orange/5 blur-[120px] rounded-full" />
-        <div className="absolute bottom-1/4 right-1/4 w-96 h-96 bg-white/5 blur-[120px] rounded-full" />
+        <div className="absolute top-1/4 left-1/4 w-96 h-96 bg-blue-400/10 blur-[120px] rounded-full" />
+        <div className="absolute bottom-1/4 right-1/4 w-96 h-96 bg-purple-400/10 blur-[120px] rounded-full" />
       </div>
 
       {/* Main Layout - Floating Widgets Structure */}
-      <div className="relative z-10 w-full h-screen flex items-center justify-center p-4 md:p-8">
+      <div className="relative z-10 w-full h-screen flex flex-col p-3 md:p-4">
         
-        {/* Left Floating Toolbar */}
-        <div className="absolute left-6 top-1/2 -translate-y-1/2 hidden lg:flex flex-col gap-4 z-20">
-          <div className="glass-card p-3 flex flex-col gap-4">
-            <div className="w-12 h-12 rounded-xl bg-accent-orange flex items-center justify-center shadow-lg shadow-accent-orange/20">
-              <span className="font-bold text-white text-xl">A</span>
+        {/* Central Canvas - Full Area */}
+        <div className="flex-1 flex items-center justify-center pb-24">
+          <div className="w-auto h-full max-w-[85vw] max-h-[70vh] aspect-square relative overflow-hidden group"
+            style={{
+              background: 'rgba(255, 255, 255, 0.6)',
+              backdropFilter: 'blur(10px)',
+              borderRadius: '20px',
+              boxShadow: '0 20px 40px -12px rgba(0, 0, 0, 0.12)',
+            }}
+          >
+            <div ref={containerRef} className="w-full h-full relative flex items-center justify-center bg-transparent">
+              <canvas ref={canvasRef} className="w-full h-full" />
             </div>
-            
-            <div className="h-px bg-white/10 w-full" />
 
-            <label className="w-12 h-12 rounded-xl flex items-center justify-center hover:bg-white/10 transition-all cursor-pointer group" title="上传图片">
-              <Upload className="w-5 h-5 text-gray-400 group-hover:text-white" />
+            {/* Canvas Overlay Info */}
+            <div className="absolute top-4 left-4 pointer-events-none">
+              <div className="flex items-center gap-2">
+                <div className="w-2 h-2 rounded-full bg-orange-500 animate-pulse" />
+                <span className="text-xs font-mono text-gray-500 tracking-wider">Ready</span>
+              </div>
+            </div>
+
+            {/* Floating Edit Toolbar */}
+            {selectedObject && (
+              <div className="absolute bottom-4 left-1/2 -translate-x-1/2 z-30 flex items-center gap-1 bg-white/90 backdrop-blur-md px-3 py-2 rounded-2xl border border-gray-100 shadow-lg">
+                <button onClick={handleUndo} disabled={!canUndo} className="p-2 hover:bg-gray-100 rounded-xl text-gray-500 hover:text-gray-700 transition-all disabled:opacity-30" title="撤销">
+                  <Undo2 className="w-4 h-4" />
+                </button>
+                <div className="w-px h-4 bg-gray-200" />
+                <button onClick={handleRotateLeft} className="p-2 hover:bg-gray-100 rounded-xl text-gray-500 hover:text-gray-700 transition-all">
+                  <RotateCcw className="w-4 h-4" />
+                </button>
+                <button onClick={handleRotateRight} className="p-2 hover:bg-gray-100 rounded-xl text-gray-500 hover:text-gray-700 transition-all">
+                  <RotateCw className="w-4 h-4" />
+                </button>
+                <div className="w-px h-4 bg-gray-200" />
+                <button onClick={handleFlipHorizontal} className="p-2 hover:bg-gray-100 rounded-xl text-gray-500 hover:text-gray-700 transition-all">
+                  <FlipHorizontal className="w-4 h-4" />
+                </button>
+                <button onClick={handleFlipVertical} className="p-2 hover:bg-gray-100 rounded-xl text-gray-500 hover:text-gray-700 transition-all">
+                  <FlipVertical className="w-4 h-4" />
+                </button>
+                <div className="w-px h-4 bg-gray-200" />
+                <button onClick={handleDelete} className="p-2 hover:bg-red-50 rounded-xl text-red-400 hover:text-red-500 transition-all">
+                  <Trash2 className="w-4 h-4" />
+                </button>
+                <div className="w-px h-4 bg-gray-200" />
+                <button onClick={handleCancelSelection} className="px-3 py-1 bg-gray-100 hover:bg-gray-200 rounded-lg text-gray-600 text-xs font-medium">
+                  完成
+                </button>
+              </div>
+            )}
+          </div>
+        </div>
+
+        {/* Bottom Fixed Toolbar - All Functions */}
+        <div className="fixed bottom-0 left-0 right-0 rounded-t-3xl px-6 py-4 pb-safe z-40"
+          style={{
+            background: 'rgba(255, 255, 255, 0.95)',
+            backdropFilter: 'blur(20px)',
+            boxShadow: '0 -10px 40px rgba(0, 0, 0, 0.1)',
+          }}
+        >
+          <div className="flex items-center justify-between w-full max-w-3xl mx-auto">
+            {/* Upload */}
+            <label className="p-3 rounded-2xl hover:bg-orange-50 transition-all cursor-pointer group active:bg-orange-100" title="上传图片">
+              <Upload className="w-6 h-6 text-gray-600 group-hover:text-orange-500" />
               <input type="file" accept="image/png" className="hidden" onChange={handleFileUpload} />
             </label>
 
-            <button onClick={handleReset} className="w-12 h-12 rounded-xl flex items-center justify-center hover:bg-white/10 transition-all group" title="重置画布">
-              <RefreshCw className="w-5 h-5 text-gray-400 group-hover:text-white" />
+            {/* Reset */}
+            <button onClick={handleReset} className="p-3 rounded-2xl hover:bg-orange-50 transition-all group active:bg-orange-100" title="重置">
+              <RefreshCw className="w-6 h-6 text-gray-600 group-hover:text-orange-500" />
             </button>
 
-            <button onClick={toggleReferenceLayer} className={`w-12 h-12 rounded-xl flex items-center justify-center transition-all border ${activeLayer === 'reference' ? 'bg-accent-orange/20 border-accent-orange/50 text-accent-orange' : 'hover:bg-white/10 border-transparent text-gray-400 hover:text-white'}`} title="切换参考层">
-              <Layers className="w-5 h-5" />
+            {/* Generate Button - Prominent */}
+            <button 
+              onClick={generateImages}
+              disabled={isGenerating}
+              className="px-10 py-3 flex items-center gap-2 font-bold text-lg rounded-2xl transition-all active:scale-95 shadow-lg"
+              style={{
+                background: 'linear-gradient(135deg, #f97316 0%, #ea580c 100%)',
+                boxShadow: '0 4px 20px rgba(249, 115, 22, 0.4)',
+                color: 'white',
+              }}
+            >
+              <Wand2 className="w-6 h-6" />
+              <span>生成</span>
+            </button>
+
+            {/* Reference Layer Toggle */}
+            <button onClick={toggleReferenceLayer} className={`p-3 rounded-2xl transition-all ${activeLayer === 'reference' ? 'bg-orange-100 text-orange-600 ring-2 ring-orange-200' : 'hover:bg-orange-50 text-gray-600 hover:text-orange-500'}`} title="参考层">
+              <Layers className="w-6 h-6" />
+            </button>
+
+            {/* Admin Settings */}
+            <button onClick={() => setShowAdmin(true)} className="p-3 rounded-2xl hover:bg-orange-50 transition-all group active:bg-orange-100" title="管理">
+              <Settings className="w-6 h-6 text-gray-600 group-hover:text-orange-500" />
             </button>
           </div>
-
-          <button onClick={() => setShowAdmin(true)} className="glass-card w-18 h-18 flex items-center justify-center hover:bg-white/10 transition-all group" title="管理后台">
-            <Shield className="w-6 h-6 text-gray-400 group-hover:text-accent-orange" />
-          </button>
-        </div>
-
-        {/* Central Canvas Card */}
-        <div className="tech-card w-full max-w-[900px] aspect-square relative overflow-hidden group">
-          <div ref={containerRef} className="w-full h-full relative flex items-center justify-center bg-transparent">
-            <canvas ref={canvasRef} />
-          </div>
-
-          {/* Canvas Overlay Info */}
-          <div className="absolute top-6 left-6 pointer-events-none">
-            <div className="flex items-center gap-3">
-              <div className="w-2 h-2 rounded-full bg-accent-orange animate-pulse" />
-              <span className="text-xs font-mono text-white/40 tracking-[0.2em] uppercase">System Active</span>
-            </div>
-          </div>
-
-          {/* Floating Edit Toolbar */}
-          {selectedObject && (
-            <div className="absolute bottom-8 left-1/2 -translate-x-1/2 z-30 flex items-center gap-1 bg-black/80 backdrop-blur-xl p-2 rounded-2xl border border-white/10 shadow-2xl">
-              <button onClick={handleUndo} disabled={!canUndo} className="p-2.5 hover:bg-white/10 rounded-xl text-gray-400 hover:text-white transition-all disabled:opacity-20" title="撤销">
-                <Undo2 className="w-4 h-4" />
-              </button>
-              <div className="w-px h-6 bg-white/10 mx-1" />
-              <button onClick={handleRotateLeft} className="p-2.5 hover:bg-white/10 rounded-xl text-gray-400 hover:text-white transition-all">
-                <RotateCcw className="w-4 h-4" />
-              </button>
-              <button onClick={handleRotateRight} className="p-2.5 hover:bg-white/10 rounded-xl text-gray-400 hover:text-white transition-all">
-                <RotateCw className="w-4 h-4" />
-              </button>
-              <div className="w-px h-6 bg-white/10 mx-1" />
-              <button onClick={handleFlipHorizontal} className="p-2.5 hover:bg-white/10 rounded-xl text-gray-400 hover:text-white transition-all">
-                <FlipHorizontal className="w-4 h-4" />
-              </button>
-              <button onClick={handleFlipVertical} className="p-2.5 hover:bg-white/10 rounded-xl text-gray-400 hover:text-white transition-all">
-                <FlipVertical className="w-4 h-4" />
-              </button>
-              <div className="w-px h-6 bg-white/10 mx-1" />
-              <button onClick={handleDelete} className="p-2.5 hover:bg-red-500/20 rounded-xl text-red-400 hover:text-red-300 transition-all">
-                <Trash2 className="w-4 h-4" />
-              </button>
-              <div className="w-px h-6 bg-white/10 mx-1" />
-              <button onClick={handleCancelSelection} className="px-4 py-2 bg-white/10 hover:bg-white/20 rounded-xl text-white text-sm font-medium transition-all">
-                完成
-              </button>
-            </div>
-          )}
-        </div>
-
-        {/* Bottom Floating Action - Web Only */}
-        <div className="absolute bottom-8 right-8 z-30 hidden lg:block">
-          <button 
-            onClick={generateImages}
-            disabled={isGenerating}
-            className="accent-button px-8 py-4 flex items-center gap-3 font-medium text-lg tracking-wide disabled:opacity-50 disabled:cursor-not-allowed group"
-          >
-            <Wand2 className="w-6 h-6 group-hover:rotate-12 transition-transform" />
-            <span>一键生成</span>
-          </button>
-        </div>
-
-        {/* Mobile Toolbar */}
-        <div className="lg:hidden fixed bottom-0 left-0 right-0 mobile-toolbar rounded-t-3xl p-4 flex items-center justify-around z-40">
-          <label className="p-3 rounded-2xl hover:bg-white/10 transition-all cursor-pointer">
-            <Upload className="w-6 h-6 text-gray-400" />
-            <input type="file" accept="image/png" className="hidden" onChange={handleFileUpload} />
-          </label>
-          <button onClick={handleReset} className="p-3 rounded-2xl hover:bg-white/10 transition-all">
-            <RefreshCw className="w-6 h-6 text-gray-400" />
-          </button>
-          <button onClick={generateImages} className="p-4 bg-accent-orange rounded-2xl shadow-lg shadow-accent-orange/20">
-            <Wand2 className="w-6 h-6 text-white" />
-          </button>
-          <button onClick={toggleReferenceLayer} className={`p-3 rounded-2xl transition-all ${activeLayer === 'reference' ? 'text-accent-orange' : 'text-gray-400'}`}>
-            <Layers className="w-6 h-6" />
-          </button>
-          <button onClick={() => setShowAdmin(true)} className="p-3 rounded-2xl hover:bg-white/10 transition-all">
-            <Shield className="w-6 h-6 text-gray-400" />
-          </button>
         </div>
       </div>
 
       {/* Modals - Updated with Glass Style */}
       {isGenerating && (
-        <div className="fixed inset-0 z-[100] flex items-center justify-center bg-black/90 backdrop-blur-xl">
-          <div className="glass-card p-10 w-[400px] flex flex-col items-center text-center border-accent-orange/20">
+        <div className="fixed inset-0 z-[100] flex items-center justify-center bg-gray-900/50 backdrop-blur-xl">
+          <div className="p-10 w-[400px] flex flex-col items-center text-center rounded-3xl"
+            style={{
+              background: 'rgba(255, 255, 255, 0.9)',
+              backdropFilter: 'blur(20px)',
+              boxShadow: '0 25px 50px -12px rgba(0, 0, 0, 0.25)',
+              border: '1px solid rgba(255, 255, 255, 0.5)'
+            }}
+          >
             <div className="w-20 h-20 mb-8 relative">
-              <div className="absolute inset-0 border-2 border-white/5 rounded-full" />
-              <div className="absolute inset-0 border-2 border-accent-orange rounded-full border-t-transparent animate-spin" />
-              <Wand2 className="absolute inset-0 m-auto w-8 h-8 text-accent-orange animate-pulse" />
+              <div className="absolute inset-0 border-2 border-gray-200 rounded-full" />
+              <div className="absolute inset-0 border-2 border-orange-500 rounded-full border-t-transparent animate-spin" />
+              <Wand2 className="absolute inset-0 m-auto w-8 h-8 text-orange-500 animate-pulse" />
             </div>
-            <h3 className="text-2xl font-medium mb-3">AI 核心处理中</h3>
-            <p className="text-sm text-accent-orange/60 font-mono tracking-widest uppercase">{loadingStep}</p>
-            <div className="w-full h-1 bg-white/5 rounded-full mt-8 overflow-hidden">
-              <div className="h-full bg-accent-orange w-1/3 animate-[shimmer_2s_infinite]" />
+            <h3 className="text-2xl font-medium mb-3 text-gray-800">AI 核心处理中</h3>
+            <p className="text-sm text-orange-600 font-mono tracking-widest uppercase">{loadingStep}</p>
+            <div className="w-full h-1 bg-gray-200 rounded-full mt-8 overflow-hidden">
+              <div className="h-full bg-orange-500 w-1/3 animate-[shimmer_2s_infinite]" />
             </div>
           </div>
         </div>
@@ -715,38 +924,51 @@ export default function App() {
 
       {/* Result Modal */}
       {resultImages && (
-        <div className="fixed inset-0 z-[100] flex items-center justify-center bg-black/90 backdrop-blur-xl p-4">
-          <div className="glass-card max-w-5xl w-full max-h-[90vh] overflow-hidden flex flex-col border-white/10">
-            <div className="flex justify-between items-center p-8 border-b border-white/5">
-              <h2 className="text-2xl font-medium tracking-tight">生成结果 <span className="text-accent-orange ml-2 text-sm font-mono tracking-widest uppercase">Success</span></h2>
-              <button onClick={() => setResultImages(null)} className="w-12 h-12 rounded-2xl bg-white/5 flex items-center justify-center hover:bg-white/10 transition-all">
-                <X className="w-6 h-6" />
+        <div className="fixed inset-0 z-[100] flex items-center justify-center bg-gray-900/50 backdrop-blur-xl p-4">
+          <div className="max-w-5xl w-full max-h-[90vh] overflow-hidden flex flex-col rounded-3xl"
+            style={{
+              background: 'rgba(255, 255, 255, 0.95)',
+              backdropFilter: 'blur(20px)',
+              boxShadow: '0 25px 50px -12px rgba(0, 0, 0, 0.25)',
+              border: '1px solid rgba(255, 255, 255, 0.5)'
+            }}
+          >
+            <div className="flex justify-between items-center p-8 border-b border-gray-200">
+              <h2 className="text-2xl font-medium tracking-tight text-gray-800">生成结果 <span className="text-orange-500 ml-2 text-sm font-mono tracking-widest uppercase">Success</span></h2>
+              <button onClick={() => setResultImages(null)} className="w-12 h-12 rounded-2xl bg-gray-100 flex items-center justify-center hover:bg-gray-200 transition-all">
+                <X className="w-6 h-6 text-gray-600" />
               </button>
             </div>
             
             <div className="flex-1 overflow-y-auto p-8 grid grid-cols-1 md:grid-cols-2 gap-10">
               <div className="flex flex-col gap-6">
                 <div className="flex items-center justify-between px-2">
-                  <h3 className="text-sm font-mono text-white/40 uppercase tracking-widest">Preview Render</h3>
-                  <Download className="w-4 h-4 text-white/20" />
+                  <h3 className="text-sm font-mono text-gray-500 uppercase tracking-widest">Preview Render</h3>
+                  <Download className="w-4 h-4 text-gray-400" />
                 </div>
-                <div className="aspect-square rounded-3xl overflow-hidden bg-black/40 border border-white/5 shadow-inner">
+                <div className="aspect-square rounded-3xl overflow-hidden bg-gray-100 border border-gray-200 shadow-inner">
                   <img src={resultImages.effect} alt="Effect Preview" className="w-full h-full object-cover" referrerPolicy="no-referrer" />
                 </div>
-                <button className="w-full py-4 rounded-2xl bg-white/5 hover:bg-white/10 transition-all text-sm font-medium border border-white/5">
+                <button 
+                  className="w-full py-4 rounded-2xl bg-gray-100 hover:bg-gray-200 transition-all text-sm font-medium border border-gray-200 text-gray-700"
+                  onClick={() => downloadImage(resultImages.effect, 'preview.jpg')}
+                >
                   下载预览图
                 </button>
               </div>
               
               <div className="flex flex-col gap-6">
                 <div className="flex items-center justify-between px-2">
-                  <h3 className="text-sm font-mono text-accent-orange uppercase tracking-widest">Production Layout</h3>
-                  <Download className="w-4 h-4 text-accent-orange/40" />
+                  <h3 className="text-sm font-mono text-orange-500 uppercase tracking-widest">Production Layout</h3>
+                  <Download className="w-4 h-4 text-orange-500/40" />
                 </div>
-                <div className="aspect-square rounded-3xl overflow-hidden bg-black/40 border border-accent-orange/10 shadow-inner">
+                <div className="aspect-square rounded-3xl overflow-hidden bg-gray-100 border border-orange-200 shadow-inner">
                   <img src={resultImages.production} alt="Production Layout" className="w-full h-full object-cover" referrerPolicy="no-referrer" />
                 </div>
-                <button className="w-full py-4 rounded-2xl bg-accent-orange/10 hover:bg-accent-orange/20 text-accent-orange transition-all text-sm font-medium border border-accent-orange/20">
+                <button 
+                  className="w-full py-4 rounded-2xl bg-orange-100 hover:bg-orange-200 transition-all text-sm font-medium border border-orange-200 text-orange-600"
+                  onClick={() => downloadImage(resultImages.production, 'production.jpg')}
+                >
                   下载生产图
                 </button>
               </div>
@@ -757,12 +979,19 @@ export default function App() {
 
       {/* Admin Modal */}
       {showAdmin && (
-        <div className="fixed inset-0 z-[100] flex items-center justify-center bg-black/90 backdrop-blur-xl p-4">
-          <div className="glass-card max-w-6xl w-full h-[90vh] flex flex-col border-white/10">
-            <div className="flex justify-between items-center p-8 border-b border-white/5">
-              <h2 className="text-2xl font-medium tracking-tight flex items-center gap-4">
-                <Shield className="w-7 h-7 text-accent-orange" />
-                管理者模式 <span className="text-white/20 text-sm font-mono">/ History</span>
+        <div className="fixed inset-0 z-[100] flex items-center justify-center bg-gray-900/50 backdrop-blur-xl p-4">
+          <div className="max-w-6xl w-full h-[90vh] flex flex-col rounded-3xl"
+            style={{
+              background: 'rgba(255, 255, 255, 0.95)',
+              backdropFilter: 'blur(20px)',
+              boxShadow: '0 25px 50px -12px rgba(0, 0, 0, 0.25)',
+              border: '1px solid rgba(255, 255, 255, 0.5)'
+            }}
+          >
+            <div className="flex justify-between items-center p-8 border-b border-gray-200">
+              <h2 className="text-2xl font-medium tracking-tight flex items-center gap-4 text-gray-800">
+                <Shield className="w-7 h-7 text-orange-500" />
+                管理者模式 <span className="text-gray-400 text-sm font-mono">/ History</span>
               </h2>
               <button onClick={() => setShowAdmin(false)} className="w-12 h-12 rounded-2xl bg-white/5 flex items-center justify-center hover:bg-white/10 transition-all">
                 <X className="w-6 h-6" />
@@ -771,51 +1000,57 @@ export default function App() {
             
             <div className="flex-1 overflow-y-auto p-8">
               {history.length === 0 ? (
-                <div className="h-full flex flex-col items-center justify-center text-white/20 gap-4">
-                  <Layers className="w-12 h-12 opacity-10" />
+                <div className="h-full flex flex-col items-center justify-center text-gray-300 gap-4">
+                  <Layers className="w-12 h-12 opacity-30" />
                   <span className="text-sm font-mono uppercase tracking-widest">No Records Found</span>
                 </div>
               ) : (
                 <div className="grid grid-cols-1 gap-10">
                   {history.map((item, index) => (
-                    <div key={item.id} className="tech-card p-8 flex flex-col gap-8">
-                      <div className="flex items-center justify-between border-b border-white/5 pb-6">
+                    <div className="p-8 flex flex-col gap-8 rounded-2xl"
+                      style={{
+                        background: 'rgba(255, 255, 255, 0.5)',
+                        backdropFilter: 'blur(10px)',
+                        border: '1px solid rgba(0, 0, 0, 0.05)'
+                      }}
+                    >
+                      <div className="flex items-center justify-between border-b border-gray-200 pb-6">
                         <div className="flex items-center gap-4">
-                          <span className="w-10 h-10 rounded-xl bg-accent-orange/10 flex items-center justify-center text-accent-orange font-mono text-sm">
+                          <span className="w-10 h-10 rounded-xl bg-orange-100 flex items-center justify-center text-orange-600 font-mono text-sm">
                             {history.length - index}
                           </span>
-                          <span className="text-lg font-medium">Task Sequence</span>
+                          <span className="text-lg font-medium text-gray-800">Task Sequence</span>
                         </div>
-                        <span className="text-xs text-white/30 font-mono tracking-wider">
+                        <span className="text-xs text-gray-400 font-mono tracking-wider">
                           {new Date(item.timestamp).toLocaleString()}
                         </span>
                       </div>
                       <div className="grid grid-cols-1 md:grid-cols-2 gap-10">
                         <div className="flex flex-col gap-4">
                           <div className="flex items-center justify-between px-1">
-                            <span className="text-[10px] font-mono text-white/40 uppercase tracking-[0.2em]">Line Art Composite</span>
+                            <span className="text-[10px] font-mono text-gray-500 uppercase tracking-[0.2em]">Line Art Composite</span>
                             <button onClick={() => {
                               const a = document.createElement('a');
                               a.href = item.line;
                               a.download = `LINE_${item.id}.png`;
                               a.click();
-                            }} className="text-[10px] text-accent-orange hover:underline uppercase tracking-widest">Download</button>
+                            }} className="text-[10px] text-orange-500 hover:underline uppercase tracking-widest">Download</button>
                           </div>
-                          <div className="aspect-square rounded-2xl overflow-hidden bg-white border border-white/10">
+                          <div className="aspect-square rounded-2xl overflow-hidden bg-gray-100 border border-gray-200">
                             <img src={item.line} alt="LINE" className="w-full h-full object-contain" referrerPolicy="no-referrer" />
                           </div>
                         </div>
                         <div className="flex flex-col gap-4">
                           <div className="flex items-center justify-between px-1">
-                            <span className="text-[10px] font-mono text-white/40 uppercase tracking-[0.2em]">Character Mask</span>
+                            <span className="text-[10px] font-mono text-gray-500 uppercase tracking-[0.2em]">Character Mask</span>
                             <button onClick={() => {
                               const a = document.createElement('a');
                               a.href = item.mask;
                               a.download = `MASK_${item.id}.png`;
                               a.click();
-                            }} className="text-[10px] text-accent-orange hover:underline uppercase tracking-widest">Download</button>
+                            }} className="text-[10px] text-orange-500 hover:underline uppercase tracking-widest">Download</button>
                           </div>
-                          <div className="aspect-square rounded-2xl overflow-hidden bg-black border border-white/10">
+                          <div className="aspect-square rounded-2xl overflow-hidden bg-gray-100 border border-gray-200">
                             <img src={item.mask} alt="MASK" className="w-full h-full object-contain" referrerPolicy="no-referrer" />
                           </div>
                         </div>
