@@ -1,0 +1,60 @@
+@import "tailwindcss";
+
+@theme {
+  --color-space-gray: #1a1a1a;
+  --color-matte-black: #000000;
+  --color-accent-orange: #ff4d00;
+  --color-accent-white: #ffffff;
+  
+  --font-sans: "Inter", ui-sans-serif, system-ui, sans-serif;
+}
+
+body {
+  background-color: var(--color-matte-black);
+  background-image: radial-gradient(rgba(255, 255, 255, 0.1) 1px, transparent 1px);
+  background-size: 32px 32px;
+  color: #ffffff;
+  font-family: var(--font-sans);
+}
+
+.glass-card {
+  background: rgba(255, 255, 255, 0.08);
+  backdrop-filter: blur(20px);
+  -webkit-backdrop-filter: blur(20px);
+  border: 1px solid rgba(255, 255, 255, 0.1);
+  border-radius: 20px;
+  box-shadow: 0 8px 32px 0 rgba(0, 0, 0, 0.37);
+}
+
+/* 移动端底部工具栏 - 深色毛玻璃 */
+.mobile-toolbar {
+  background: rgba(0, 0, 0, 0.85);
+  backdrop-filter: blur(20px);
+  -webkit-backdrop-filter: blur(20px);
+  border-top: 1px solid rgba(255, 255, 255, 0.08);
+  box-shadow: 0 -4px 20px rgba(0, 0, 0, 0.5);
+}
+
+.tech-card {
+  background: #121212;
+  border-radius: 20px;
+  border: 1px solid rgba(255, 255, 255, 0.05);
+  box-shadow: 0 10px 30px rgba(0, 0, 0, 0.5);
+}
+
+.accent-button {
+  background: var(--color-accent-orange);
+  color: white;
+  border-radius: 12px;
+  transition: all 0.3s ease;
+}
+
+.accent-button:hover {
+  filter: brightness(1.1);
+  box-shadow: 0 0 20px rgba(255, 77, 0, 0.4);
+}
+
+@keyframes shimmer {
+  0% { transform: translateX(-100%); }
+  100% { transform: translateX(100%); }
+}
